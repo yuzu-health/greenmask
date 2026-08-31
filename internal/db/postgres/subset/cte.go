@@ -1,6 +1,7 @@
 package subset
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -34,7 +35,7 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 		componentTables = append(componentTables, t)
 	}
 	slices.SortFunc(componentTables, func(a, b *entries.Table) int {
-		return int(a.Oid) - int(b.Oid)
+		return cmp.Compare(a.Oid, b.Oid)
 	})
 	for _, t := range componentTables {
 		if t.Oid == targetTable.Oid {
