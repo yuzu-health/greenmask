@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -87,6 +88,219 @@ values ('da-DK', 'Opsæt din konto hos {{coachName}}',
         'Bonjour {{firstName}},\n\nVotre programme d''entraînement est maintenant prêt - il est joint à cet email en format PDF.\nVous pouvez le télécharger et l''imprimer afin de le transporter avec vous.\nVous pouvez également y accéder directement depuis votre portable.\n\nJ''espère vraiment que vous apprécierez de suivre ce plan. Si vous vous y tenez, je suis sûr que vous obtiendrez d''excellents résultats.\n\nMerci d''avoir passé votre commande.\n\nBien cordialement\n{{coachName}})');
 `
 )
+
+const multiCycleGroupSccDb = `
+CREATE TABLE org (
+    id            INT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    aggregator_id INT
+);
+
+CREATE TABLE connect_account (
+    id     INT PRIMARY KEY,
+    org_id INT
+);
+
+CREATE TABLE financial_account (
+    id                  INT PRIMARY KEY,
+    external_account_id INT NOT NULL
+);
+
+CREATE TABLE aggregator (
+    id                   INT PRIMARY KEY,
+    org_id               INT,
+    financial_account_id INT NOT NULL,
+    captive_id           INT
+);
+
+ALTER TABLE org ADD CONSTRAINT org_aggregator_fkey
+    FOREIGN KEY (aggregator_id) REFERENCES aggregator (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE connect_account ADD CONSTRAINT connect_account_org_fkey
+    FOREIGN KEY (org_id) REFERENCES org (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE financial_account ADD CONSTRAINT financial_account_connect_fkey
+    FOREIGN KEY (external_account_id) REFERENCES connect_account (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE aggregator ADD CONSTRAINT aggregator_org_fkey
+    FOREIGN KEY (org_id) REFERENCES org (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE aggregator ADD CONSTRAINT aggregator_financial_account_fkey
+    FOREIGN KEY (financial_account_id) REFERENCES financial_account (id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE aggregator ADD CONSTRAINT aggregator_captive_fkey
+    FOREIGN KEY (captive_id) REFERENCES aggregator (id) DEFERRABLE INITIALLY DEFERRED;
+
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+
+INSERT INTO org (id, name, aggregator_id)
+VALUES (1, 'in-scope-a', 101), (2, 'in-scope-b', 102), (3, 'out-a', 103), (4, 'out-b', NULL);
+
+INSERT INTO connect_account (id, org_id)
+VALUES (201, 1), (202, 2), (203, 3), (204, NULL);
+
+INSERT INTO financial_account (id, external_account_id)
+VALUES (301, 201), (302, 202), (303, 203), (304, 204);
+
+INSERT INTO aggregator (id, org_id, financial_account_id, captive_id)
+VALUES (101, 1, 301, NULL), (102, 2, 302, 101), (103, 3, 303, NULL), (104, NULL, 304, NULL);
+
+COMMIT;
+`
+
+// getSubsetQueryResultIds - executes the subset query of each table and returns the ordered ids per table name
+func getSubsetQueryResultIds(
+	ctx context.Context, t *testing.T, tx pgx.Tx, dataSectionObjects []entries.Entry,
+) map[string][]int {
+	res := make(map[string][]int)
+	for _, table := range dataSectionObjects {
+		tab, ok := table.(*entries.Table)
+		if !ok {
+			continue
+		}
+		require.NotEmptyf(t, tab.Query, "Table %s", tab.Name)
+		rows, err := tx.Query(ctx, fmt.Sprintf("SELECT id FROM (%s) AS s", tab.Query))
+		require.NoErrorf(t, err, "Table %s", tab.Name)
+		ids := []int{}
+		for rows.Next() {
+			var id int
+			require.NoError(t, rows.Scan(&id))
+			ids = append(ids, id)
+		}
+		rows.Close()
+		require.NoError(t, rows.Err())
+		slices.Sort(ids)
+		res[tab.Name] = ids
+	}
+	return res
+}
+
+func TestNewRuntimeContext_subset_multiCycleGroupsInScc(t *testing.T) {
+	// This test is a regression test for https://github.com/GreenmaskIO/greenmask/issues/197
+	// The SCC contains three cycle groups: the aggregator self-reference, the cycle
+	// {aggregator, org} and the cycle {aggregator, financial_account, connect_account, org}.
+	// Previously the subset query generation panicked with
+	// "IMPLEMENT ME: more than one cycle group found in SCC".
+	ctx := context.Background()
+	connStr, cleanup, err := runPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer cleanup()
+
+	con, err := pgx.Connect(ctx, connStr)
+	require.NoError(t, err)
+	defer con.Close(ctx) // nolint: errcheck
+	require.NoError(t, initTables(ctx, con, multiCycleGroupSccDb))
+	tx, err := con.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx) // nolint: errcheck
+	cfg := &domains.Dump{
+		Transformation: []*domains.Table{
+			{
+				Schema: "public",
+				Name:   "org",
+				SubsetConds: []string{
+					"public.org.id IN (1, 2)",
+				},
+			},
+		},
+	}
+	rc, err := NewRuntimeContext(ctx, tx, cfg, utils.DefaultTransformerRegistry, nil, testContainerPgVersion*10000)
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	require.False(t, rc.IsFatal())
+
+	expectedIds := map[string][]int{
+		"org":               {1, 2},
+		"aggregator":        {101, 102},
+		"connect_account":   {201, 202},
+		"financial_account": {301, 302},
+	}
+	require.Equal(t, expectedIds, getSubsetQueryResultIds(ctx, t, tx, rc.DataSectionObjects))
+}
+
+func TestNewRuntimeContext_subset_selfReferenceAndCycle(t *testing.T) {
+	// This test is a regression test for https://github.com/GreenmaskIO/greenmask/issues/197
+	// The SCC contains two cycle groups: the aggregator self-reference and the cycle
+	// {aggregator, org}.
+	ctx := context.Background()
+	connStr, cleanup, err := runPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer cleanup()
+
+	con, err := pgx.Connect(ctx, connStr)
+	require.NoError(t, err)
+	defer con.Close(ctx) // nolint: errcheck
+	require.NoError(t, initTables(ctx, con, multiCycleGroupSccDb))
+	_, err = con.Exec(ctx, "ALTER TABLE aggregator DROP CONSTRAINT aggregator_financial_account_fkey")
+	require.NoError(t, err)
+	tx, err := con.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx) // nolint: errcheck
+	cfg := &domains.Dump{
+		Transformation: []*domains.Table{
+			{
+				Schema: "public",
+				Name:   "org",
+				SubsetConds: []string{
+					"public.org.id IN (1, 2)",
+				},
+			},
+		},
+	}
+	rc, err := NewRuntimeContext(ctx, tx, cfg, utils.DefaultTransformerRegistry, nil, testContainerPgVersion*10000)
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	require.False(t, rc.IsFatal())
+
+	expectedIds := map[string][]int{
+		"org":               {1, 2},
+		"aggregator":        {101, 102},
+		"connect_account":   {201, 202, 204},
+		"financial_account": {301, 302, 304},
+	}
+	require.Equal(t, expectedIds, getSubsetQueryResultIds(ctx, t, tx, rc.DataSectionObjects))
+}
+
+func TestNewRuntimeContext_subset_singleCycleGroup(t *testing.T) {
+	// This test validates that the single cycle group generation keeps working: the SCC contains
+	// only the cycle {aggregator, org} after the self-reference and the aggregator -> financial_account
+	// edges are dropped
+	ctx := context.Background()
+	connStr, cleanup, err := runPostgresContainer(ctx)
+	require.NoError(t, err)
+	defer cleanup()
+
+	con, err := pgx.Connect(ctx, connStr)
+	require.NoError(t, err)
+	defer con.Close(ctx) // nolint: errcheck
+	require.NoError(t, initTables(ctx, con, multiCycleGroupSccDb))
+	_, err = con.Exec(ctx, "ALTER TABLE aggregator DROP CONSTRAINT aggregator_financial_account_fkey")
+	require.NoError(t, err)
+	_, err = con.Exec(ctx, "ALTER TABLE aggregator DROP CONSTRAINT aggregator_captive_fkey")
+	require.NoError(t, err)
+	tx, err := con.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx) // nolint: errcheck
+	cfg := &domains.Dump{
+		Transformation: []*domains.Table{
+			{
+				Schema: "public",
+				Name:   "org",
+				SubsetConds: []string{
+					"public.org.id IN (1, 2)",
+				},
+			},
+		},
+	}
+	rc, err := NewRuntimeContext(ctx, tx, cfg, utils.DefaultTransformerRegistry, nil, testContainerPgVersion*10000)
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	require.False(t, rc.IsFatal())
+
+	expectedIds := map[string][]int{
+		"org":               {1, 2},
+		"aggregator":        {101, 102},
+		"connect_account":   {201, 202, 204},
+		"financial_account": {301, 302, 304},
+	}
+	require.Equal(t, expectedIds, getSubsetQueryResultIds(ctx, t, tx, rc.DataSectionObjects))
+}
 
 func TestNewRuntimeContext(t *testing.T) {
 	ctx := context.Background()
