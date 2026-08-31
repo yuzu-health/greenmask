@@ -29,7 +29,14 @@ func (c *cteQuery) addItem(name, query string) {
 func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 	var queries []string
 	var excludedCteQueries []string
+	componentTables := make([]*entries.Table, 0, len(c.c.tables))
 	for _, t := range c.c.tables {
+		componentTables = append(componentTables, t)
+	}
+	slices.SortFunc(componentTables, func(a, b *entries.Table) int {
+		return int(a.Oid) - int(b.Oid)
+	})
+	for _, t := range componentTables {
 		if t.Oid == targetTable.Oid {
 			continue
 		}

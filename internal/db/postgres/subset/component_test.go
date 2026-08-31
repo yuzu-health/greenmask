@@ -183,8 +183,7 @@ func TestComponent_getSortedGroupIds(t *testing.T) {
 
 	groupIds := c.getSortedGroupIds()
 	require.Len(t, groupIds, 3)
-	require.Equal(t, "1_2_3", groupIds[0])
-	require.ElementsMatch(t, []string{"1", "1_2"}, groupIds[1:])
+	require.Equal(t, []string{"1_2_3", "1", "1_2"}, groupIds)
 
 	require.Len(t, c.getCycleGroup(groupIds[0]), 1)
 	require.Len(t, c.getCycleGroupTables(groupIds[0]), 3)
