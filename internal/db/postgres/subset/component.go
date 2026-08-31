@@ -91,6 +91,86 @@ func (c *Component) hasCycle() bool {
 	return len(c.cycles) > 0
 }
 
+// getCycleGroup - returns the cycles of the group by the group id
+func (c *Component) getCycleGroup(groupId string) [][]*Edge {
+	cycleIdxs, ok := c.groupedCycles[groupId]
+	if !ok {
+		panic(fmt.Sprintf("cycle group %s does not exist", groupId))
+	}
+	res := make([][]*Edge, 0, len(cycleIdxs))
+	for _, idx := range cycleIdxs {
+		res = append(res, c.cycles[idx])
+	}
+	return res
+}
+
+// getCycleGroupTables - returns the tables of the group vertexes sorted by oid.
+// All cycles in the group share the same vertex set, so the first cycle is enough.
+func (c *Component) getCycleGroupTables(groupId string) []*entries.Table {
+	return getTablesFromCycle(c.getCycleGroup(groupId)[0])
+}
+
+// groupHasOwnSubsetConds - returns true if any table of the group vertexes has its own subset conditions
+func (c *Component) groupHasOwnSubsetConds(groupId string) bool {
+	for _, t := range c.getCycleGroupTables(groupId) {
+		if len(t.SubsetConds) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// groupsShareVertexes - returns true if two groups have at least one common vertex (table)
+func (c *Component) groupsShareVertexes(groupIdA, groupIdB string) bool {
+	tablesA := c.getCycleGroupTables(groupIdA)
+	for _, tb := range c.getCycleGroupTables(groupIdB) {
+		if slices.ContainsFunc(tablesA, func(ta *entries.Table) bool { return ta.Oid == tb.Oid }) {
+			return true
+		}
+	}
+	return false
+}
+
+// getSortedGroupIds - returns the cycle group ids in a deterministic processing order: the groups
+// that carry their own subset conditions go first, then the groups that share vertexes with the
+// already ordered groups. This way each conditionless group can be restricted by the results of
+// the previously generated groups it overlaps with.
+func (c *Component) getSortedGroupIds() []string {
+	remaining := make([]string, 0, len(c.groupedCycles))
+	for groupId := range c.groupedCycles {
+		remaining = append(remaining, groupId)
+	}
+	slices.Sort(remaining)
+
+	var ordered []string
+	take := func(cond func(groupId string) bool) {
+		for idx := 0; idx < len(remaining); {
+			if cond(remaining[idx]) {
+				ordered = append(ordered, remaining[idx])
+				remaining = slices.Delete(remaining, idx, idx+1)
+			} else {
+				idx++
+			}
+		}
+	}
+
+	take(c.groupHasOwnSubsetConds)
+	for len(remaining) > 0 {
+		prevLen := len(remaining)
+		take(func(groupId string) bool {
+			return slices.ContainsFunc(ordered, func(orderedId string) bool {
+				return c.groupsShareVertexes(orderedId, groupId)
+			})
+		})
+		if len(remaining) == prevLen {
+			// No group shares vertexes with the ordered ones - take the next one as is
+			ordered = append(ordered, remaining[0])
+			remaining = remaining[1:]
+		}
+	}
+	return ordered
+}
+
 // findCycles - finds all cycles in the component
 func (c *Component) findCycles() {
 	visited := make(map[int]bool)

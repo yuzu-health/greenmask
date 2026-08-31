@@ -29,14 +29,11 @@ func (c *cteQuery) addItem(name, query string) {
 func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 	var queries []string
 	var excludedCteQueries []string
-	if len(c.c.groupedCycles) > 1 {
-		panic("FIXME: found more than one grouped cycle")
-	}
-	for _, edge := range c.c.cycles[0] {
-		if edge.from.table.Oid == targetTable.Oid {
+	for _, t := range c.c.tables {
+		if t.Oid == targetTable.Oid {
 			continue
 		}
-		excludedCteQuery := fmt.Sprintf("%s__%s__ids", edge.from.table.Schema, edge.from.table.Name)
+		excludedCteQuery := fmt.Sprintf("%s__%s__ids", t.Schema, t.Name)
 		excludedCteQueries = append(excludedCteQueries, excludedCteQuery)
 	}
 

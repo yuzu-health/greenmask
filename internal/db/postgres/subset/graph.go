@@ -403,17 +403,89 @@ func (g *Graph) generateQueryForScc(cq *cteQuery, scopeId int, path *Path, prevS
 		rootVertex = prevScopeEdge.originalCondensedEdge.to.component
 	}
 	//cycle := orderCycle(rootVertex.cycles[0], edges, path.scopeGraph[scopeId])
-	if len(rootVertex.groupedCycles) > 1 {
-		panic("IMPLEMENT ME: more than one cycle group found in SCC")
+	if len(rootVertex.groupedCycles) == 1 {
+		cycleGroup := rootVertex.getOneCycleGroup()
+		overlapMap := g.getOverlapMap(cycleGroup)
+		for _, cycle := range cycleGroup {
+			g.generateRecursiveQueriesForCycle(cq, scopeId, cycle, edges, nextScopeEdges, overlapMap, nil)
+		}
+
+		g.generateFilteredQueries(cq, cycleGroup, scopeId)
+		g.generateQueriesForVertexesInCycle(cq, scopeId, cycleGroup)
+		return
 	}
-	cycleGroup := rootVertex.getOneCycleGroup()
-	overlapMap := g.getOverlapMap(cycleGroup)
-	for _, cycle := range cycleGroup {
-		g.generateRecursiveQueriesForCycle(cq, scopeId, cycle, edges, nextScopeEdges, overlapMap)
+	g.generateQueriesForMultiGroupScc(cq, scopeId, rootVertex, edges, nextScopeEdges)
+}
+
+// generateQueriesForMultiGroupScc - generates the queries for the SCC that contains more than one
+// cycle group (cycles grouped by their vertex set). Each group is generated with the same machinery
+// as the single-group case, in the deterministic order provided by getSortedGroupIds. Groups that
+// share vertexes with the previously generated groups are additionally restricted by the valid
+// primary keys of those groups so that exclusions propagate between the groups. The resulting
+// per-table id selections are the intersection of the valid keys of every group the table belongs to.
+func (g *Graph) generateQueriesForMultiGroupScc(
+	cq *cteQuery, scopeId int, rootVertex *Component, edges []*CondensedEdge, nextScopeEdges []*ScopeEdge,
+) {
+	groupIds := rootVertex.getSortedGroupIds()
+	groupIdsByTableOid := make(map[toolkit.Oid][]string)
+	tablesInComponent := make(map[toolkit.Oid]*entries.Table)
+
+	for groupPos, groupId := range groupIds {
+		cycleGroup := rootVertex.getCycleGroup(groupId)
+
+		// Restrict the group traversal by the valid keys of the previously generated groups
+		// that share tables with this group
+		var extraConds []string
+		for _, t := range rootVertex.getCycleGroupTables(groupId) {
+			for _, prevGroupId := range groupIds[:groupPos] {
+				if slices.Contains(groupIdsByTableOid[t.Oid], prevGroupId) {
+					extraConds = append(extraConds, generateGroupValidKeysInClause(scopeId, prevGroupId, t))
+				}
+			}
+			groupIdsByTableOid[t.Oid] = append(groupIdsByTableOid[t.Oid], groupId)
+			tablesInComponent[t.Oid] = t
+		}
+
+		overlapMap := g.getOverlapMap(cycleGroup)
+		for _, cycle := range cycleGroup {
+			g.generateRecursiveQueriesForCycle(cq, scopeId, cycle, edges, nextScopeEdges, overlapMap, extraConds)
+		}
+		g.generateFilteredQueries(cq, cycleGroup, scopeId)
+
+		// Per-group valid primary keys selection for each table of the group
+		for _, t := range getTablesFromCycle(cycleGroup[0]) {
+			queryName := getGroupValidKeysQueryName(scopeId, groupId, t)
+			query := generateAllTablesValidPkSelection(cycleGroup, scopeId, t)
+			cq.addItem(queryName, query)
+		}
 	}
 
-	g.generateFilteredQueries(cq, cycleGroup, scopeId)
-	g.generateQueriesForVertexesInCycle(cq, scopeId, cycleGroup)
+	// The final per-table id selection is the intersection of the valid keys of all the groups
+	// the table participates in
+	sortedTables := make([]*entries.Table, 0, len(tablesInComponent))
+	for _, t := range tablesInComponent {
+		sortedTables = append(sortedTables, t)
+	}
+	slices.SortFunc(sortedTables, func(a, b *entries.Table) int {
+		return cmp.Compare(a.Oid, b.Oid)
+	})
+	for _, t := range sortedTables {
+		var keys []string
+		for _, k := range t.PrimaryKey {
+			keys = append(keys, fmt.Sprintf(`"%s"`, k))
+		}
+		var intersectParts []string
+		for _, groupId := range groupIdsByTableOid[t.Oid] {
+			part := fmt.Sprintf(
+				`SELECT %s FROM "%s"`,
+				strings.Join(keys, ", "),
+				getGroupValidKeysQueryName(scopeId, groupId, t),
+			)
+			intersectParts = append(intersectParts, part)
+		}
+		queryName := fmt.Sprintf("%s__%s__ids", t.Schema, t.Name)
+		cq.addItem(queryName, strings.Join(intersectParts, " INTERSECT "))
+	}
 }
 
 func (g *Graph) getOverlapMap(cycles [][]*Edge) map[string][][]*Edge {
@@ -442,7 +514,7 @@ func (g *Graph) generateQueriesForVertexesInCycle(cq *cteQuery, scopeId int, cyc
 
 func (g *Graph) generateRecursiveQueriesForCycle(
 	cq *cteQuery, scopeId int, cycle []*Edge, rest []*CondensedEdge, nextScopeEdges []*ScopeEdge,
-	overlapMap map[string][][]*Edge,
+	overlapMap map[string][][]*Edge, extraConds []string,
 ) {
 	overriddenTableNames := make(map[toolkit.Oid]string)
 	rest = slices.Clone(rest)
@@ -457,12 +529,12 @@ func (g *Graph) generateRecursiveQueriesForCycle(
 	shiftedCycle := slices.Clone(cycle)
 	for idx := 1; idx <= len(cycle); idx++ {
 		queryName := getCycleQueryName(scopeId, shiftedCycle, "")
-		query := generateQuery(queryName, shiftedCycle, rest, overriddenTableNames)
+		query := generateQuery(queryName, shiftedCycle, rest, overriddenTableNames, extraConds)
 		cq.addItem(queryName, query)
 		cycleId := getCycleId(shiftedCycle)
 		if len(overlapMap[cycleId]) > 0 {
 			overlapQueryName := getCycleQueryName(scopeId, shiftedCycle, "overlap")
-			overlapQuery := generateOverlapQuery(scopeId, overlapQueryName, shiftedCycle, rest, overriddenTableNames, overlapMap[cycleId])
+			overlapQuery := generateOverlapQuery(scopeId, overlapQueryName, shiftedCycle, rest, overriddenTableNames, overlapMap[cycleId], extraConds)
 			cq.addItem(overlapQueryName, overlapQuery)
 		}
 		shiftedCycle = shiftCycle(shiftedCycle)
@@ -674,6 +746,7 @@ func isPathForScc(path *Path, graph *Graph) bool {
 
 func generateQuery(
 	queryName string, cycle []*Edge, rest []*CondensedEdge, overriddenTables map[toolkit.Oid]string,
+	extraConds []string,
 ) string {
 	var (
 		selectKeys                             []string
@@ -698,6 +771,7 @@ func generateQuery(
 			cycleSubsetConds = append(cycleSubsetConds, t.SubsetConds...)
 		}
 	}
+	cycleSubsetConds = append(cycleSubsetConds, extraConds...)
 
 	var droppedKeysWithAliases []string
 	for _, k := range droppedEdge.from.keys {
@@ -751,6 +825,9 @@ func generateQuery(
 
 	recursiveIntegrityChecks := slices.Clone(cycleSubsetConds)
 	recursiveIntegrityChecks = append(recursiveIntegrityChecks, integrityChecks...)
+	if len(recursiveIntegrityChecks) == 0 {
+		recursiveIntegrityChecks = append(recursiveIntegrityChecks, "TRUE")
+	}
 	recursiveIntegrityCheck := fmt.Sprintf("(%s) AS valid", strings.Join(recursiveIntegrityChecks, " AND "))
 	recursiveKeys := slices.Clone(selectKeys)
 	for _, k := range cycle[0].from.table.PrimaryKey {
@@ -807,7 +884,7 @@ func generateQuery(
 func generateOverlapQuery(
 	scopeId int,
 	queryName string, cycle []*Edge, rest []*CondensedEdge, overriddenTables map[toolkit.Oid]string,
-	overlap [][]*Edge,
+	overlap [][]*Edge, extraConds []string,
 ) string {
 	var (
 		selectKeys                             []string
@@ -874,6 +951,10 @@ func generateOverlapQuery(
 
 	integrityChecks := generateIntegrityChecksForNullableEdges(nullabilityMap, edges, overriddenTables)
 	integrityChecks = append(integrityChecks, cycleSubsetConds...)
+	integrityChecks = append(integrityChecks, extraConds...)
+	if len(integrityChecks) == 0 {
+		integrityChecks = append(integrityChecks, "TRUE")
+	}
 	initialIntegrityCheck := fmt.Sprintf("(%s) AS valid", strings.Join(integrityChecks, " AND "))
 	initialKeys = append(initialKeys, initialIntegrityCheck)
 	initialSelect := fmt.Sprintf("SELECT %s", strings.Join(initialKeys, ", "))
@@ -1139,6 +1220,28 @@ func getCyclesGroupQueryName(scopeId int, cycle []*Edge) string {
 
 func getCyclesGroupQueryNameByMainTable(scopeId int, groupId string, mainTable *entries.Table) string {
 	return fmt.Sprintf("__s%d__g%s__%s__%s", scopeId, groupId, mainTable.Schema, mainTable.Name)
+}
+
+// getGroupValidKeysQueryName - returns the name of the CTE item that contains the valid primary
+// keys of the table within the given cycle group
+func getGroupValidKeysQueryName(scopeId int, groupId string, table *entries.Table) string {
+	return fmt.Sprintf("__s%d__g%s__%s__%s__ids", scopeId, groupId, table.Schema, table.Name)
+}
+
+// generateGroupValidKeysInClause - generates the IN clause that restricts the table rows to the
+// valid primary keys of the given cycle group
+func generateGroupValidKeysInClause(scopeId int, groupId string, table *entries.Table) string {
+	var leftTableKeys, rightTableKeys []string
+	for _, k := range table.PrimaryKey {
+		leftTableKeys = append(leftTableKeys, fmt.Sprintf(`"%s"."%s"."%s"`, table.Schema, table.Name, k))
+		rightTableKeys = append(rightTableKeys, fmt.Sprintf(`"%s"`, k))
+	}
+	return fmt.Sprintf(
+		`(%s) IN (SELECT %s FROM "%s")`,
+		strings.Join(leftTableKeys, ", "),
+		strings.Join(rightTableKeys, ", "),
+		getGroupValidKeysQueryName(scopeId, groupId, table),
+	)
 }
 
 func shiftCycleGroup(g [][]*Edge) [][]*Edge {
