@@ -22,7 +22,10 @@ type Reference struct {
 	Name   string
 	// ReferencedKeys - list of foreign keys of current table
 	ReferencedKeys []string
-	IsNullable     bool
+	// RefTableKeys - the columns of the referenced table that the foreign key points to
+	// (the referenced table's primary key or another unique key)
+	RefTableKeys []string
+	IsNullable   bool
 }
 
 type Table struct {

@@ -10,17 +10,23 @@ import (
 )
 
 type cteQuery struct {
-	items []*cteItem
-	c     *Component
+	items      []*cteItem
+	addedNames map[string]struct{}
+	c          *Component
 }
 
 func newCteQuery(c *Component) *cteQuery {
 	return &cteQuery{
-		c: c,
+		c:          c,
+		addedNames: make(map[string]struct{}),
 	}
 }
 
 func (c *cteQuery) addItem(name, query string) {
+	if _, exists := c.addedNames[name]; exists {
+		return
+	}
+	c.addedNames[name] = struct{}{}
 	c.items = append(c.items, &cteItem{
 		name:  name,
 		query: query,
@@ -28,6 +34,10 @@ func (c *cteQuery) addItem(name, query string) {
 }
 
 func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
+	return c.generateQuerySelect(targetTable, []string{"*"})
+}
+
+func (c *cteQuery) generateQuerySelect(targetTable *entries.Table, selectCols []string) string {
 	var queries []string
 	var excludedCteQueries []string
 	componentTables := make([]*entries.Table, 0, len(c.c.tables))
@@ -49,7 +59,7 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 		if slices.Contains(excludedCteQueries, item.name) {
 			continue
 		}
-		queries = append(queries, fmt.Sprintf(" %s AS (%s)", item.name, item.query))
+		queries = append(queries, fmt.Sprintf(` "%s" AS (%s)`, item.name, item.query))
 	}
 	var leftTableKeys, rightTableKeys []string
 	rightTableName := fmt.Sprintf("%s__%s__ids", targetTable.Schema, targetTable.Name)
@@ -59,7 +69,8 @@ func (c *cteQuery) generateQuery(targetTable *entries.Table) string {
 	}
 
 	resultingQuery := fmt.Sprintf(
-		`SELECT * FROM "%s"."%s" WHERE %s IN (SELECT %s FROM "%s")`,
+		`SELECT %s FROM "%s"."%s" WHERE %s IN (SELECT %s FROM "%s")`,
+		strings.Join(selectCols, ", "),
 		targetTable.Schema,
 		targetTable.Name,
 		fmt.Sprintf("(%s)", strings.Join(leftTableKeys, ",")),

@@ -16,6 +16,7 @@ package context
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -53,6 +54,9 @@ type RuntimeContext struct {
 	DatabaseSchema toolkit.DatabaseSchema
 	// Graph - graph of Tables with dependencies
 	Graph *subset.Graph
+	// SubsetScratchSchema - the schema holding the materialized subset key-set tables when
+	// subset_materialization is "temp_tables", empty otherwise
+	SubsetScratchSchema string
 }
 
 // NewRuntimeContext - creating new runtime context.
@@ -112,11 +116,28 @@ func NewRuntimeContext(
 	}
 
 	// Set subset queries for Tables if they have subset conditions or sort Tables by size and transformation costs
+	var subsetScratchSchema string
 	if hasSubset(tables) {
 		// If table has subset the restoration must be in the topological order
 		// The Tables must be dumped one by one
 		if err = subset.SetSubsetQueries(graph); err != nil {
 			return nil, fmt.Errorf("cannot set subset queries: %w", err)
+		}
+		switch cfg.SubsetMaterialization {
+		case "", subset.SubsetMaterializationNone:
+		case subset.SubsetMaterializationInline:
+			if err = subset.MaterializeSubsetQueries(ctx, tx, graph); err != nil {
+				return nil, fmt.Errorf("cannot materialize subset queries: %w", err)
+			}
+		case subset.SubsetMaterializationTempTables:
+			subsetScratchSchema, err = materializeSubsetQueriesTempTables(ctx, tx, graph)
+			if err != nil {
+				return nil, fmt.Errorf("cannot materialize subset queries: %w", err)
+			}
+		default:
+			return nil, fmt.Errorf("unknown subset_materialization value %q: expected %q, %q or %q",
+				cfg.SubsetMaterialization, subset.SubsetMaterializationNone,
+				subset.SubsetMaterializationInline, subset.SubsetMaterializationTempTables)
 		}
 		debugQueries(tables)
 	} else {
@@ -157,7 +178,46 @@ func NewRuntimeContext(
 		DatabaseSchema:               schema,
 		Graph:                        graph,
 		DataSectionObjectsToValidate: dataSectionObjectsToValidate,
+		SubsetScratchSchema:          subsetScratchSchema,
 	}, nil
+}
+
+// materializeSubsetQueriesTempTables - runs the temp_tables subset materialization on a separate
+// autocommit connection so that the key-set tables are committed and visible to the dump worker
+// connections, and returns the created scratch schema name (empty if materialization was skipped)
+func materializeSubsetQueriesTempTables(ctx context.Context, tx pgx.Tx, graph *subset.Graph) (string, error) {
+	conn, err := pgx.ConnectConfig(ctx, tx.Conn().Config().Copy())
+	if err != nil {
+		return "", fmt.Errorf("cannot connect for subset materialization: %w", err)
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			log.Debug().Err(err).Msg("unable to close subset materialization connection")
+		}
+	}()
+
+	schemaSuffix := make([]byte, 4)
+	if _, err = rand.Read(schemaSuffix); err != nil {
+		return "", fmt.Errorf("cannot generate scratch schema name: %w", err)
+	}
+	schemaName := fmt.Sprintf("greenmask_subset_%s", hex.EncodeToString(schemaSuffix))
+	if _, err = conn.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA "%s"`, schemaName)); err != nil {
+		return "", fmt.Errorf("cannot create scratch schema: %w", err)
+	}
+	materialized, err := subset.MaterializeSubsetQueriesTempTables(ctx, conn, graph, schemaName)
+	if err != nil {
+		if _, dropErr := conn.Exec(ctx, fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, schemaName)); dropErr != nil {
+			log.Warn().Err(dropErr).Str("SchemaName", schemaName).Msg("unable to drop scratch schema")
+		}
+		return "", err
+	}
+	if !materialized {
+		if _, err = conn.Exec(ctx, fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, schemaName)); err != nil {
+			return "", fmt.Errorf("cannot drop scratch schema: %w", err)
+		}
+		return "", nil
+	}
+	return schemaName, nil
 }
 
 func (rc *RuntimeContext) IsFatal() bool {
