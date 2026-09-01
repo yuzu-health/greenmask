@@ -14,7 +14,11 @@ type Path struct {
 	scopeEdges         map[int][]*CondensedEdge
 	scopeEdgesNullable map[int]map[int]bool
 	// scopeGraph - graph scope to scope connections
-	scopeGraph      map[int][]*ScopeEdge
+	scopeGraph map[int][]*ScopeEdge
+	// vertexScopes - the scope where each vertex's table is available in the FROM clause. Edges outgoing
+	// from a vertex must be placed in that scope so that the generated joins and conditions can
+	// reference the vertex's table
+	vertexScopes    map[int]int
 	edges           []*CondensedEdge
 	graph           map[int][]*CondensedEdge
 	scopeIdSequence int
@@ -26,6 +30,7 @@ func NewPath(rootVertex int) *Path {
 		scopeGraph:         make(map[int][]*ScopeEdge),
 		scopeEdges:         make(map[int][]*CondensedEdge),
 		scopeEdgesNullable: make(map[int]map[int]bool),
+		vertexScopes:       make(map[int]int),
 		scopeIdSequence:    rootScopeId,
 		graph:              make(map[int][]*CondensedEdge),
 	}
@@ -60,6 +65,9 @@ func (p *Path) addEdge(e *CondensedEdge, scopeId int) int {
 	if scopeId > p.scopeIdSequence {
 		panic("scopeId is greater than the sequence")
 	}
+	if s, ok := p.vertexScopes[e.from.idx]; ok {
+		scopeId = s
+	}
 	p.createScopeIfNotExist(scopeId)
 
 	// If the vertex is already in the scope (or has cycle) then fork the scope and put the edge in the new scope
@@ -74,6 +82,9 @@ func (p *Path) addEdge(e *CondensedEdge, scopeId int) int {
 		}
 		p.scopeEdgesNullable[scopeId][e.to.idx] = isNullable
 		p.scopeEdges[scopeId] = append(p.scopeEdges[scopeId], e)
+	}
+	if _, ok := p.vertexScopes[e.to.idx]; !ok {
+		p.vertexScopes[e.to.idx] = scopeId
 	}
 	p.edges = append(p.edges, e)
 	p.vertexes = append(p.vertexes, e.to.idx)

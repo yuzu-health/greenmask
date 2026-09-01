@@ -74,7 +74,10 @@ type Dump struct {
 	tableOidToDumpId  map[toolkit.Oid]int32
 	tocFileSize       int64
 	version           int
-	blobs             *entries.Blobs
+	// skipWorkerSnapshot - do not import the main transaction snapshot in the dump workers, so
+	// that they see the subset key-set tables committed after that snapshot was exported
+	skipWorkerSnapshot bool
+	blobs              *entries.Blobs
 	// dumpDependenciesGraph - map of table DumpId to its dependencies DumpIds. Stores in meta and uses for restoration
 	// coordination according to the topological order
 	dumpDependenciesGraph map[int32][]int32
@@ -529,6 +532,15 @@ func (d *Dump) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("context error: %w", err)
 	}
 
+	if d.context.SubsetScratchSchema != "" {
+		defer d.dropSubsetScratchSchema(ctx)
+		// The scratch schema is committed after the main transaction snapshot, so the workers
+		// must not import that snapshot to see the materialized key-set tables
+		log.Info().Msg("subset_materialization=temp_tables: disabling synchronized snapshots so the dump workers see the materialized key-set tables; the source database must not receive concurrent writes during the dump")
+		d.skipWorkerSnapshot = true
+		d.pgDumpOptions.ExcludeSchema = append(d.pgDumpOptions.ExcludeSchema, d.context.SubsetScratchSchema)
+	}
+
 	if err = d.schemaOnlyDump(ctx, tx); err != nil {
 		return fmt.Errorf("schema only stage dumping error: %w", err)
 	}
@@ -546,6 +558,25 @@ func (d *Dump) Run(ctx context.Context) (err error) {
 	}
 
 	return nil
+}
+
+// dropSubsetScratchSchema - drops the schema with the materialized subset key-set tables on a
+// separate connection, since the main connection is held by the dump transaction
+func (d *Dump) dropSubsetScratchSchema(ctx context.Context) {
+	conn, err := pgx.Connect(ctx, d.dsn)
+	if err != nil {
+		log.Warn().Err(err).Str("SchemaName", d.context.SubsetScratchSchema).Msg("unable to connect to drop the subset scratch schema")
+		return
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			log.Debug().Err(err).Msg("unable to close connection")
+		}
+	}()
+	query := fmt.Sprintf(`DROP SCHEMA IF EXISTS "%s" CASCADE`, d.context.SubsetScratchSchema)
+	if _, err := conn.Exec(ctx, query); err != nil {
+		log.Warn().Err(err).Str("SchemaName", d.context.SubsetScratchSchema).Msg("unable to drop the subset scratch schema")
+	}
 }
 
 func (d *Dump) MergeTocEntries(schemaEntries []*toc.Entry, dataEntries []*toc.Entry) (
@@ -609,7 +640,7 @@ func (d *Dump) getWorkerTransaction(ctx context.Context) (*pgx.Conn, pgx.Tx, err
 		}
 		return nil, nil, fmt.Errorf("cannot start transaction: %w", err)
 	}
-	if !d.pgDumpOptions.NoSynchronizedSnapshots {
+	if !d.pgDumpOptions.NoSynchronizedSnapshots && !d.skipWorkerSnapshot {
 		if _, err := tx.Exec(ctx, setIsolationLevelQuery); err != nil {
 			if err := conn.Close(ctx); err != nil {
 				log.Debug().Err(err).Msg("unable to close connection")

@@ -87,7 +87,7 @@ func generateJoinClauseV2(edge *Edge, joinType string, overriddenTables map[tool
 
 	rightTableName := fmt.Sprintf(`"%s"."%s"`, rightTable.Schema, rightTable.Name)
 	if override, ok := overriddenTables[rightTable.Oid]; ok {
-		rightTableName = override
+		rightTableName = fmt.Sprintf(`"%s"`, override)
 	}
 
 	joinClause := fmt.Sprintf(
@@ -99,12 +99,72 @@ func generateJoinClauseV2(edge *Edge, joinType string, overriddenTables map[tool
 	return joinClause
 }
 
+// generateOverriddenTableInClause - generates a membership condition for an edge whose
+// referenced table is overridden by an ids CTE. The CTE cannot be joined directly because
+// several edges may reference it, which would produce duplicate relation names in the FROM
+// clause; an IN subquery keeps the same semantics without a join.
+func generateOverriddenTableInClause(edge *Edge, overriddenName string, nullable bool) string {
+	if len(edge.from.polymorphicExprs) > 0 || len(edge.to.polymorphicExprs) > 0 {
+		panic("IMPLEMENT ME: polymorphic expression for overridden table")
+	}
+	var leftKeys, rightKeys, nullChecks []string
+	for idx := range edge.from.keys {
+		lk := edge.from.keys[idx].GetKeyReference(edge.from.table)
+		leftKeys = append(leftKeys, lk)
+		nullChecks = append(nullChecks, fmt.Sprintf("%s IS NULL", lk))
+		rightKeys = append(rightKeys, fmt.Sprintf(`"%s"`, edge.to.keys[idx].Name))
+	}
+	rightTable := edge.to.table
+	refKeysArePk := len(edge.to.keys) == len(rightTable.PrimaryKey)
+	if refKeysArePk {
+		for idx, k := range edge.to.keys {
+			if k.Name != rightTable.PrimaryKey[idx] {
+				refKeysArePk = false
+				break
+			}
+		}
+	}
+	var inClause string
+	if refKeysArePk {
+		inClause = fmt.Sprintf(
+			`(%s) IN (SELECT %s FROM "%s")`,
+			strings.Join(leftKeys, ", "), strings.Join(rightKeys, ", "), overriddenName,
+		)
+	} else {
+		// The ids CTE only exposes the primary key columns, while the FK references other
+		// (unique) columns: select those columns from the table itself restricted by the CTE
+		var refCols, pkCols, ctePkCols []string
+		for _, k := range edge.to.keys {
+			refCols = append(refCols, k.GetKeyReference(rightTable))
+		}
+		for _, k := range rightTable.PrimaryKey {
+			pkCols = append(pkCols, fmt.Sprintf(`"%s"."%s"."%s"`, rightTable.Schema, rightTable.Name, k))
+			ctePkCols = append(ctePkCols, fmt.Sprintf(`"%s"`, k))
+		}
+		inClause = fmt.Sprintf(
+			`(%s) IN (SELECT %s FROM "%s"."%s" WHERE (%s) IN (SELECT %s FROM "%s"))`,
+			strings.Join(leftKeys, ", "), strings.Join(refCols, ", "),
+			rightTable.Schema, rightTable.Name,
+			strings.Join(pkCols, ", "), strings.Join(ctePkCols, ", "), overriddenName,
+		)
+	}
+	if nullable {
+		return fmt.Sprintf(`(%s OR %s)`, strings.Join(nullChecks, " OR "), inClause)
+	}
+	return inClause
+}
+
 func generateWhereClause(subsetConds []string) string {
 	if len(subsetConds) == 0 {
 		return "WHERE TRUE"
 	}
 	escapedConds := make([]string, 0, len(subsetConds))
+	seen := make(map[string]struct{}, len(subsetConds))
 	for _, cond := range subsetConds {
+		if _, ok := seen[cond]; ok {
+			continue
+		}
+		seen[cond] = struct{}{}
 		escapedConds = append(escapedConds, fmt.Sprintf(`( %s )`, cond))
 	}
 	return "WHERE " + strings.Join(escapedConds, " AND ")
