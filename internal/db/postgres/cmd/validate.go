@@ -21,6 +21,7 @@ import (
 	"github.com/greenmaskio/greenmask/internal/db/postgres/entries"
 	"github.com/greenmaskio/greenmask/internal/db/postgres/pgcopy"
 	storageDto "github.com/greenmaskio/greenmask/internal/db/postgres/storage"
+	"github.com/greenmaskio/greenmask/internal/db/postgres/subset"
 	"github.com/greenmaskio/greenmask/internal/db/postgres/toc"
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/custom"
 	"github.com/greenmaskio/greenmask/internal/db/postgres/transformers/utils"
@@ -123,6 +124,13 @@ func (v *Validate) Run(ctx context.Context) (int, error) {
 		return nonZeroExitCode, err
 	}
 	v.config.Dump.Transformation = tablesToValidate
+
+	// temp_tables materialization is a dump-time optimization: validate does not manage the
+	// scratch schema lifecycle, so skip the materialization here
+	if v.config.Dump.SubsetMaterialization == subset.SubsetMaterializationTempTables {
+		log.Info().Msg("subset_materialization=temp_tables is skipped during validate")
+		v.config.Dump.SubsetMaterialization = subset.SubsetMaterializationNone
+	}
 
 	v.context, err = runtimeContext.NewRuntimeContext(
 		ctx, tx, &v.config.Dump, v.registry,
