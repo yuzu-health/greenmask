@@ -533,7 +533,7 @@ func (d *Dump) Run(ctx context.Context) (err error) {
 	}
 
 	if d.context.SubsetScratchSchema != "" {
-		defer d.dropSubsetScratchSchema(ctx)
+		defer d.dropSubsetScratchSchema()
 		// The scratch schema is committed after the main transaction snapshot, so the workers
 		// must not import that snapshot to see the materialized key-set tables
 		log.Info().Msg("subset_materialization=temp_tables: disabling synchronized snapshots so the dump workers see the materialized key-set tables; the source database must not receive concurrent writes during the dump")
@@ -561,8 +561,11 @@ func (d *Dump) Run(ctx context.Context) (err error) {
 }
 
 // dropSubsetScratchSchema - drops the schema with the materialized subset key-set tables on a
-// separate connection, since the main connection is held by the dump transaction
-func (d *Dump) dropSubsetScratchSchema(ctx context.Context) {
+// separate connection, since the main connection is held by the dump transaction. The cleanup
+// uses its own bounded context so it still runs when the dump context is already cancelled
+func (d *Dump) dropSubsetScratchSchema() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	conn, err := pgx.Connect(ctx, d.dsn)
 	if err != nil {
 		log.Warn().Err(err).Str("SchemaName", d.context.SubsetScratchSchema).Msg("unable to connect to drop the subset scratch schema")

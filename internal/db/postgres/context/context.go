@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -206,9 +207,7 @@ func materializeSubsetQueriesTempTables(ctx context.Context, tx pgx.Tx, graph *s
 	}
 	materialized, err := subset.MaterializeSubsetQueriesTempTables(ctx, conn, graph, schemaName)
 	if err != nil {
-		if _, dropErr := conn.Exec(ctx, fmt.Sprintf(`DROP SCHEMA "%s" CASCADE`, schemaName)); dropErr != nil {
-			log.Warn().Err(dropErr).Str("SchemaName", schemaName).Msg("unable to drop scratch schema")
-		}
+		dropScratchSchema(tx.Conn().Config(), schemaName)
 		return "", err
 	}
 	if !materialized {
@@ -218,6 +217,27 @@ func materializeSubsetQueriesTempTables(ctx context.Context, tx pgx.Tx, graph *s
 		return "", nil
 	}
 	return schemaName, nil
+}
+
+// dropScratchSchema - drops the scratch schema on a fresh connection with its own bounded
+// context, so the cleanup still runs when the calling context is already cancelled and the
+// materialization connection is no longer usable
+func dropScratchSchema(connConfig *pgx.ConnConfig, schemaName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, connConfig.Copy())
+	if err != nil {
+		log.Warn().Err(err).Str("SchemaName", schemaName).Msg("unable to connect to drop the scratch schema")
+		return
+	}
+	defer func() {
+		if err := conn.Close(ctx); err != nil {
+			log.Debug().Err(err).Msg("unable to close connection")
+		}
+	}()
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS "%s" CASCADE`, schemaName)); err != nil {
+		log.Warn().Err(err).Str("SchemaName", schemaName).Msg("unable to drop the scratch schema")
+	}
 }
 
 func (rc *RuntimeContext) IsFatal() bool {

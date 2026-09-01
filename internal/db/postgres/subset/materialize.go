@@ -383,11 +383,12 @@ func inlineInCond(fromRefs []string, refTable *entries.Table, refCols []string, 
 	return cond, nil
 }
 
+// columnTypeName - returns the actual source column type: the materialized values are compared
+// against untransformed source columns, so transformer type overrides must not affect the cast
 func columnTypeName(t *entries.Table, colName string) (string, error) {
 	for _, c := range t.Columns {
 		if c.Name == colName {
-			typeName, _ := c.GetType()
-			return typeName, nil
+			return c.TypeName, nil
 		}
 	}
 	return "", fmt.Errorf(`cannot find column "%s" in table "%s"."%s"`, colName, t.Schema, t.Name)
